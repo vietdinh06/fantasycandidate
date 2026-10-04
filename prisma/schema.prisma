@@ -1,0 +1,125 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Campaign {
+  id        String   @id @default(cuid())
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  day       Int      @default(1)
+  status    String   @default("setup")
+
+  candidate CandidateProfile?
+  events    CampaignEvent[]
+  responses Response[]
+  blocs     VoterBlocSnapshot[]
+  states    StateSnapshot[]
+  summaries CandidateSummary[]
+
+  @@index([status])
+}
+
+model CandidateProfile {
+  id          String   @id @default(cuid())
+  campaignId  String   @unique
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  name        String
+  party       String
+  homeState   String
+  background  String?
+  summary     String?
+  personality Json?
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+}
+
+model CampaignEvent {
+  id               String   @id @default(cuid())
+  campaignId       String
+  createdAt        DateTime @default(now())
+  day              Int
+  category         String
+  prompt           String
+  scenario         String?
+  opponentResponse String?
+  metadata         Json?
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  response  Response?
+
+  @@unique([campaignId, day])
+  @@index([campaignId, createdAt])
+}
+
+model Response {
+  id             String   @id @default(cuid())
+  campaignId     String
+  eventId        String   @unique
+  createdAt      DateTime @default(now())
+  day            Int
+  text           String
+  interpretation Json?
+  consequences   Json?
+
+  campaign CampaignEvent @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  game     Campaign      @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  @@index([campaignId, day])
+}
+
+model VoterBlocSnapshot {
+  id               String   @id @default(cuid())
+  campaignId       String
+  createdAt        DateTime @default(now())
+  day              Int
+  name             String
+  color            String
+  population       Int
+  share            Float
+  supportPlayer    Float
+  supportOpponent  Float
+  changeFromPrior  Float    @default(0)
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  @@unique([campaignId, day, name])
+  @@index([campaignId, day])
+}
+
+model StateSnapshot {
+  id              String   @id @default(cuid())
+  campaignId      String
+  createdAt       DateTime @default(now())
+  day             Int
+  name            String
+  abbreviation    String
+  electoralVotes  Int
+  population      Int
+  lean            Float
+  playerPercent   Float
+  opponentPercent Float
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  @@unique([campaignId, day, abbreviation])
+  @@index([campaignId, day])
+}
+
+model CandidateSummary {
+  id         String   @id @default(cuid())
+  campaignId String
+  createdAt  DateTime @default(now())
+  day        Int
+  summary    String
+  source     String
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  @@unique([campaignId, day])
+  @@index([campaignId, day])
+}

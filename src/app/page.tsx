@@ -7,11 +7,13 @@ import { ArrowRight, ArrowUpRight, ChevronRight, CircleHelp, Clock3, MapPin, Rad
 type Candidate = "you" | "opponent";
 type Party = "Democrat" | "Republican" | "Independent";
 type Screen = "home" | "setup" | "campaign";
+type CampaignTab = "live" | "history";
 
 type StatePoll = {
   name: string;
   abbreviation: string;
   electoralVotes: number;
+  population: number;
   you: number;
   opponent: number;
   category: "safe" | "lean" | "tossup";
@@ -23,6 +25,7 @@ type Bloc = {
   you: number;
   change: number;
   color: string;
+  population?: number;
 };
 
 type GeneratedCampaign = {
@@ -30,6 +33,12 @@ type GeneratedCampaign = {
   summary: string;
   blocs: Bloc[];
   stateLeans: Array<{ name: string; lean: number }>;
+};
+
+type HistorySnapshot = {
+  day: number;
+  states: StatePoll[];
+  blocs: Bloc[];
 };
 
 const geoUrl = "https://cdn.jsdelivr.net/npm/us-atlas@3/states-10m.json";
@@ -44,18 +53,18 @@ function buildStates(stateLeans: Array<{ name: string; lean: number }>): StatePo
     const fictionalLean = leanMap.get(name) ?? 0;
     const you = clamp(50 + fictionalLean / 2, 35, 65);
     const margin = you - (100 - you);
-    return { name, abbreviation, electoralVotes, lean: fictionalLean, you, opponent: 100 - you, category: Math.abs(margin) < 4 ? "tossup" : Math.abs(margin) < 10 ? "lean" : "safe" };
+    return { name, abbreviation, electoralVotes, population: Math.round(300_000 + Math.random() * 39_700_000), lean: fictionalLean, you, opponent: 100 - you, category: Math.abs(margin) < 4 ? "tossup" : Math.abs(margin) < 10 ? "lean" : "safe" };
   });
 }
 
 function buildBlocs(generatedBlocs?: Bloc[]): Bloc[] {
-  if (generatedBlocs?.length) return generatedBlocs;
+  if (generatedBlocs?.length) return generatedBlocs.map((bloc) => ({ ...bloc, population: bloc.population ?? Math.round(350_000_000 * bloc.share / 100) }));
   return [
-    { name: "Dog voters", share: 26, you: 46, change: 0, color: "#e7a36f" },
-    { name: "Toilet paper traditionalists", share: 22, you: 46, change: 0, color: "#79b5ad" },
-    { name: "People who hate overhead lighting", share: 18, you: 48, change: 0, color: "#d87985" },
-    { name: "Weekend philosophers", share: 21, you: 45, change: 0, color: "#a99ad8" },
-    { name: "Snack economy voters", share: 13, you: 43, change: 0, color: "#d7c06b" },
+    { name: "Dog voters", share: 26, you: 46, change: 0, color: "#e7a36f", population: 91_000_000 },
+    { name: "Toilet paper traditionalists", share: 22, you: 46, change: 0, color: "#79b5ad", population: 77_000_000 },
+    { name: "People who hate overhead lighting", share: 18, you: 48, change: 0, color: "#d87985", population: 63_000_000 },
+    { name: "Weekend philosophers", share: 21, you: 45, change: 0, color: "#a99ad8", population: 73_500_000 },
+    { name: "Snack economy voters", share: 13, you: 43, change: 0, color: "#d7c06b", population: 45_500_000 },
   ];
 }
 
@@ -81,14 +90,21 @@ export default function Home() {
   const [candidateName, setCandidateName] = useState("");
   const [party, setParty] = useState<Party>("Independent");
   const [homeState, setHomeState] = useState("Michigan");
+  const [background, setBackground] = useState("");
   const [candidateSummary, setCandidateSummary] = useState("");
   const [campaignSource, setCampaignSource] = useState<GeneratedCampaign["source"]>("random-fallback");
   const [isGenerating, setIsGenerating] = useState(false);
+  const [isGeneratingBackground, setIsGeneratingBackground] = useState(false);
+  const [isRespiningSummary, setIsRespiningSummary] = useState(false);
+  const [campaignId, setCampaignId] = useState<string | null>(null);
+  const [campaignTab, setCampaignTab] = useState<CampaignTab>("live");
+  const [history, setHistory] = useState<HistorySnapshot[]>([]);
   const [states, setStates] = useState<StatePoll[]>([]);
   const [blocs, setBlocs] = useState<Bloc[]>([]);
   const [response, setResponse] = useState("");
   const [eventIndex, setEventIndex] = useState(0);
   const [activeState, setActiveState] = useState<StatePoll | null>(null);
+  const [cursor, setCursor] = useState({ x: 0, y: 0 });
   const [lastAction, setLastAction] = useState("Your first response is waiting.");
 
   const question = eventQuestions[eventIndex % eventQuestions.length];
@@ -101,24 +117,58 @@ export default function Home() {
   const electoralCount = (candidate: Candidate) =>
     states.reduce((total, state) => total + (state[candidate] > state[candidate === "you" ? "opponent" : "you"] ? state.electoralVotes : 0), 0);
 
+  async function generateBackground() {
+    if (!candidateName.trim()) return;
+    setIsGeneratingBackground(true);
+    try {
+      const response = await fetch("/api/generate-candidate", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ kind: "background", candidateName, party, homeState }) });
+      const generated = await response.json() as { value?: string };
+      if (generated.value) setBackground(generated.value);
+    } finally {
+      setIsGeneratingBackground(false);
+    }
+  }
+
+  async function respinSummary() {
+    if (!candidateName.trim() || !background.trim()) return;
+    setIsRespiningSummary(true);
+    try {
+      const response = await fetch("/api/generate-candidate", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ kind: "summary", candidateName, party, homeState, background }) });
+      const generated = await response.json() as { value?: string };
+      if (generated.value) setCandidateSummary(generated.value);
+    } finally {
+      setIsRespiningSummary(false);
+    }
+  }
+
   async function startCampaign(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const name = candidateName.trim();
     if (!name) return;
     setIsGenerating(true);
     try {
-      const response = await fetch("/api/generate-campaign", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ candidateName: name, party, homeState, states: stateCatalog.map(([stateName]) => ({ name: stateName })) }) });
+      const response = await fetch("/api/generate-campaign", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ candidateName: name, party, homeState, background, states: stateCatalog.map(([stateName]) => ({ name: stateName })) }) });
       const generated = await response.json() as GeneratedCampaign;
       setCandidateSummary(generated.summary);
       setCampaignSource(generated.source);
-      setStates(buildStates(generated.stateLeans));
-      setBlocs(buildBlocs(generated.blocs));
+      const initialStates = buildStates(generated.stateLeans);
+      const initialBlocs = buildBlocs(generated.blocs);
+      setStates(initialStates);
+      setBlocs(initialBlocs);
+      setHistory([{ day: 1, states: initialStates, blocs: initialBlocs }]);
+      const saved = await fetch("/api/campaigns", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ candidateName: name, party, homeState, background, summary: generated.summary, states: initialStates, blocs: initialBlocs, event: { category: eventQuestions[0].context, prompt: eventQuestions[0].question } }) });
+      if (saved.ok) setCampaignId((await saved.json() as { campaignId?: string }).campaignId || null);
     } catch {
       const fallbackLeans = stateCatalog.map(([stateName]) => ({ name: stateName, lean: Math.round((Math.random() * 50 - 25) * 10) / 10 }));
       setCandidateSummary(`${name} is a ${party.toLowerCase()} candidate from ${homeState} with an unpredictable coalition and no obligation to resemble ordinary politics.`);
       setCampaignSource("random-fallback");
-      setStates(buildStates(fallbackLeans));
-      setBlocs(buildBlocs());
+      const initialStates = buildStates(fallbackLeans);
+      const initialBlocs = buildBlocs();
+      setStates(initialStates);
+      setBlocs(initialBlocs);
+      setHistory([{ day: 1, states: initialStates, blocs: initialBlocs }]);
+      const saved = await fetch("/api/campaigns", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ candidateName: name, party, homeState, background, summary: `${name} is a ${party.toLowerCase()} candidate from ${homeState} with an unpredictable coalition and no obligation to resemble ordinary politics.`, states: initialStates, blocs: initialBlocs, event: { category: eventQuestions[0].context, prompt: eventQuestions[0].question } }) });
+      if (saved.ok) setCampaignId((await saved.json() as { campaignId?: string }).campaignId || null);
     } finally {
       setIsGenerating(false);
     }
@@ -137,7 +187,7 @@ export default function Home() {
   if (screen === "setup") return (
     <main className="campaign-shell">
       <header className="topbar"><button className="brand-lockup brand-button" onClick={() => setScreen("home")}><div className="brand-mark"><Vote size={18} strokeWidth={2.4} /></div><div><p className="eyebrow">FANTASY CANDIDATE</p><p className="brand-title">The 2032 race</p></div></button><div className="topbar-status">BEFORE DAY 1</div><button className="help-button" aria-label="Open help"><CircleHelp size={19} /></button></header>
-      <section className="setup-shell"><div className="setup-intro"><p className="eyebrow accent">BEFORE DAY 1</p><h1>Who is asking<br /><span>for the vote?</span></h1><p>Start with a few facts. Then let the campaign generator invent the electorate, the map, and the strange coalition you have to win.</p></div><form className="setup-form" onSubmit={startCampaign}><label>Candidate name<input value={candidateName} onChange={(event) => setCandidateName(event.target.value)} placeholder="Your name" autoFocus /></label><label>Political identity<select value={party} onChange={(event) => setParty(event.target.value as Party)}><option>Independent</option><option>Democrat</option><option>Republican</option></select></label><label>Home state<select value={homeState} onChange={(event) => setHomeState(event.target.value)}>{stateCatalog.map(([stateName]) => <option key={stateName}>{stateName}</option>)}</select></label><div className="setup-preview"><div className="preview-heading"><span className="eyebrow">CAMPAIGN GENERATOR</span><Sparkles size={16} /></div><p>{candidateName.trim() ? `${candidateName.trim()} · ${party} · ${homeState}` : "Your candidate · Party · Home state"}</p><small>AI will invent your starting blocs and state leans. Reality is not a requirement.</small></div><button className="primary-action" type="submit" disabled={!candidateName.trim() || isGenerating}>{isGenerating ? "Inventing the electorate..." : "Begin Day 1"} <ArrowRight size={17} /></button></form></section>
+      <section className="setup-shell"><div className="setup-intro"><p className="eyebrow accent">BEFORE DAY 1</p><h1>Who is asking<br /><span>for the vote?</span></h1><p>Start with a few facts. Then let the campaign generator invent the electorate, the map, and the strange coalition you have to win.</p></div><form className="setup-form" onSubmit={startCampaign}><label>Candidate name<input value={candidateName} onChange={(event) => setCandidateName(event.target.value)} placeholder="Your name" autoFocus /></label><label>Political identity<select value={party} onChange={(event) => setParty(event.target.value as Party)}><option>Independent</option><option>Democrat</option><option>Republican</option></select></label><label>Home state<select value={homeState} onChange={(event) => setHomeState(event.target.value)}>{stateCatalog.map(([stateName]) => <option key={stateName}>{stateName}</option>)}</select></label><label>Candidate background<textarea className="background-input" value={background} onChange={(event) => setBackground(event.target.value)} placeholder="Write the strange, sincere, or completely implausible story behind your candidate..." /><button className="secondary-action" type="button" onClick={generateBackground} disabled={!candidateName.trim() || isGeneratingBackground}><Sparkles size={14} /> {isGeneratingBackground ? "Writing a background..." : "Have AI create one"}</button></label><div className="setup-preview"><div className="preview-heading"><span className="eyebrow">CAMPAIGN GENERATOR</span><Sparkles size={16} /></div><p>{candidateName.trim() ? `${candidateName.trim()} · ${party} · ${homeState}` : "Your candidate · Party · Home state"}</p><small>AI will invent your starting blocs and state leans. Reality is not a requirement.</small></div><button className="primary-action" type="submit" disabled={!candidateName.trim() || isGenerating}>{isGenerating ? "Inventing the electorate..." : "Begin Day 1"} <ArrowRight size={17} /></button></form></section>
     </main>
   );
 
@@ -149,21 +199,26 @@ export default function Home() {
     const isJobsFocused = /job|wage|factory|worker|manufactur|union/.test(words);
     const isCostFocused = /cost|price|tax|rent|health|grocery|inflation/.test(words);
     const lift = isJobsFocused || isCostFocused ? 1.1 : 0.45;
-    const focus = isJobsFocused ? "working-class voters" : isCostFocused ? "college suburbs" : "undecided voters";
+    const focus = isJobsFocused ? "the work-and-wage coalition" : isCostFocused ? "the comfort-and-cost coalition" : "the undecided blocs";
 
-    setStates((current) => current.map((state, index) => {
+    const nextStates = states.map((state, index) => {
       const isTarget = ["Michigan", "Pennsylvania", "Wisconsin", "Arizona"].includes(state.name);
       const adjustment = isTarget ? lift + (index % 2 === 0 ? 0.15 : 0) : lift * 0.18;
       return { ...state, you: clamp(state.you + adjustment, 35, 60), opponent: clamp(state.opponent - adjustment * 0.68, 35, 60) };
-    }));
-    setBlocs((current) => current.map((bloc) => {
-      const matches = (isJobsFocused && /working|rural/.test(bloc.name.toLowerCase())) || (isCostFocused && /suburb|young/.test(bloc.name.toLowerCase()));
+    });
+    const nextBlocs = blocs.map((bloc, index) => {
+      const matches = (isJobsFocused || isCostFocused) && index < 2;
       return matches ? { ...bloc, you: clamp(bloc.you + 2.2, 0, 100), change: bloc.change + 0.9 } : bloc;
-    }));
+    });
+    setStates(nextStates);
+    setBlocs(nextBlocs);
+    setHistory((current) => [...current, { day: current.length + 1, states: nextStates, blocs: nextBlocs }]);
     setLastAction(`Response filed. The model read it as ${isJobsFocused ? "an economic populist message" : isCostFocused ? "a cost-of-living message" : "a broad leadership message"}, lifting ${focus}.`);
     setResponse("");
     setEventIndex((current) => current + 1);
   }
+
+  if (campaignTab === "history") return <HistoryView candidateName={candidateName} snapshots={history} currentStates={states} currentBlocs={blocs} onBack={() => setCampaignTab("live")} />;
 
   return (
     <main className="campaign-shell">
@@ -176,15 +231,25 @@ export default function Home() {
       <div className="campaign-grid">
         <section className="main-column">
           <div className="race-heading"><div><p className="eyebrow accent">GENERAL ELECTION</p><h1>{candidateName}.<br /><span>Make it count.</span></h1><p className="candidate-subline">{party} · {homeState}</p></div><div className="opponent-card"><span className="opponent-label">YOUR OPPONENT</span><strong>Morgan Hale</strong><span className="party-tag">REPUBLICAN</span></div></div>
-          <div className="candidate-brief"><Sparkles size={15} /><span>{candidateSummary}</span><small>{campaignSource === "openai" ? "AI WORLD" : "RANDOM WORLD"}</small></div><div className="poll-strip"><div className="poll-side player"><span>YOU</span><strong>{national.you.toFixed(1)}%</strong><small><ArrowUpRight size={13} /> Fictional starting point</small></div><div className="poll-bar"><div className="poll-fill player-fill" style={{ width: `${national.you}%` }} /><div className="poll-fill opponent-fill" style={{ width: `${national.opponent}%` }} /></div><div className="poll-side opponent"><span>HALE</span><strong>{national.opponent.toFixed(1)}%</strong><small>Fictional starting point</small></div></div>
+          <div className="candidate-brief"><Sparkles size={15} /><span>{candidateSummary}</span><small>{campaignSource === "openai" ? "AI WORLD" : "RANDOM WORLD"}</small><button className="brief-action" type="button" onClick={respinSummary} disabled={isRespiningSummary || !background.trim()}>{isRespiningSummary ? "Respinning..." : "Respin summary"}</button></div><div className="campaign-tabs"><button className="active" onClick={() => setCampaignTab("live")}>Live campaign</button><button onClick={() => setCampaignTab("history")}>History <span>{history.length}</span></button><span className="campaign-id">{campaignId ? `Campaign ${campaignId.slice(0, 7)}` : "Saving campaign..."}</span></div><div className="poll-strip"><div className="poll-side player"><span>YOU</span><strong>{national.you.toFixed(1)}%</strong><small><ArrowUpRight size={13} /> Fictional starting point</small></div><div className="poll-bar"><div className="poll-fill player-fill" style={{ width: `${national.you}%` }} /><div className="poll-fill opponent-fill" style={{ width: `${national.opponent}%` }} /></div><div className="poll-side opponent"><span>HALE</span><strong>{national.opponent.toFixed(1)}%</strong><small>Fictional starting point</small></div></div>
 
-          <section className="map-panel"><div className="panel-heading"><div><p className="eyebrow">ELECTORAL COLLEGE</p><h2>The road to 270</h2></div><div className="map-legend"><span><i className="legend-swatch you-swatch" /> You</span><span><i className="legend-swatch opponent-swatch" /> Hale</span><span><i className="legend-swatch tossup-swatch" /> Toss-up</span></div></div><div className="map-wrap"><ComposableMap projection="geoAlbersUsa" projectionConfig={{ scale: 920 }} width={900} height={520} className="us-map"><Geographies geography={geoUrl}>{({ geographies }) => geographies.map((geo) => { const state = states.find((item) => item.name === geo.properties?.name); return <Geography key={geo.rsmKey} geography={geo} fill={stateFill(state)} stroke="#15202c" strokeWidth={0.7} className="state-shape" onMouseEnter={() => state && setActiveState(state)} onMouseLeave={() => setActiveState(null)} />; })}</Geographies></ComposableMap>{activeState && <div className="state-tooltip"><div><span>{activeState.name}</span><strong>{activeState.electoralVotes} EV</strong></div><p><b>{activeState.you.toFixed(1)}%</b> you <span>vs.</span> <b>{activeState.opponent.toFixed(1)}%</b> Hale</p><small>{activeState.you > activeState.opponent ? "You lead" : "Hale leads"} by {Math.abs(activeState.you - activeState.opponent).toFixed(1)} pts</small></div>}</div><div className="map-foot"><span><MapPin size={14} /> Hover a state to inspect the race</span><span><b>{electoralCount("you")}</b> of 270 electoral votes projected</span></div></section>
+          <section className="map-panel"><div className="panel-heading"><div><p className="eyebrow">ELECTORAL COLLEGE</p><h2>The road to 270</h2></div><div className="map-legend"><span><i className="legend-swatch you-swatch" /> You</span><span><i className="legend-swatch opponent-swatch" /> Hale</span><span><i className="legend-swatch tossup-swatch" /> Toss-up</span></div></div><div className="map-wrap" onMouseMove={(event) => { const bounds = event.currentTarget.getBoundingClientRect(); setCursor({ x: event.clientX - bounds.left, y: event.clientY - bounds.top }); }}><ComposableMap projection="geoAlbersUsa" projectionConfig={{ scale: 920 }} width={900} height={520} className="us-map"><Geographies geography={geoUrl}>{({ geographies }) => geographies.map((geo) => { const state = states.find((item) => item.name === geo.properties?.name); return <Geography key={geo.rsmKey} geography={geo} fill={stateFill(state)} stroke="#15202c" strokeWidth={0.7} className="state-shape" onMouseEnter={() => state && setActiveState(state)} onMouseLeave={() => setActiveState(null)} />; })}</Geographies></ComposableMap>{activeState && <div className="state-tooltip state-tooltip-follow" style={{ left: `${cursor.x + 16}px`, top: `${cursor.y + 16}px` }}><div><span>{activeState.name}</span><strong>{activeState.electoralVotes} EV</strong></div><p><b>{activeState.you.toFixed(1)}%</b> you <span>vs.</span> <b>{activeState.opponent.toFixed(1)}%</b> Hale</p><small>{activeState.population.toLocaleString()} residents · {activeState.you > activeState.opponent ? "You lead" : "Hale leads"} by {Math.abs(activeState.you - activeState.opponent).toFixed(1)} pts</small></div>}</div><div className="map-foot"><span><MapPin size={14} /> Hover a state to inspect the race</span><span><b>{electoralCount("you")}</b> of 270 electoral votes projected</span></div></section>
 
           <section className="response-panel"><div className="event-meta"><span className="on-air"><Radio size={13} /> ON AIR</span><span>{question.label}</span><span><Clock3 size={14} /> DAY {eventIndex + 1} OF 30</span></div><p className="eyebrow accent">QUESTION {eventIndex + 1}</p><h2>{question.question}</h2><p className="event-context">{question.context} <span>·</span> Your response becomes part of your record.</p><form onSubmit={submitResponse}><textarea value={response} onChange={(event) => setResponse(event.target.value)} placeholder="Say what you believe..." maxLength={500} aria-label="Your campaign response" /><div className="composer-footer"><span>{response.length}/500</span><button type="submit" disabled={!response.trim()}>Submit response <Send size={15} /></button></div></form><p className="action-log">{lastAction}</p></section>
         </section>
 
-        <aside className="side-column"><section className="score-card"><div className="score-card-heading"><span className="eyebrow">PROJECTED ELECTORAL VOTE</span><span className="score-trend"><ArrowUpRight size={14} /> +18</span></div><div className="score-number">{electoralCount("you")} <span>/ 538</span></div><div className="score-meter"><span style={{ width: `${(electoralCount("you") / 538) * 100}%` }} /></div><div className="score-foot"><span>270 to win</span><strong>{electoralCount("you") >= 270 ? "Winning" : "Behind by " + Math.max(0, 270 - electoralCount("you"))}</strong></div></section><section className="blocs-panel"><div className="panel-heading compact"><div><p className="eyebrow">THE ELECTORATE</p><h2>Voter blocs</h2></div><button className="text-button">View all <ChevronRight size={15} /></button></div><div className="blocs-list">{blocs.map((bloc) => <div className="bloc-row" key={bloc.name}><div className="bloc-name"><i style={{ backgroundColor: bloc.color }} /><span>{bloc.name}</span><small>{bloc.share}%</small></div><div className="bloc-meter"><span style={{ width: `${bloc.you}%`, backgroundColor: bloc.color }} /></div><div className={`bloc-change ${bloc.change > 0 ? "positive" : "negative"}`}>{bloc.change > 0 ? "+" : ""}{bloc.change.toFixed(1)}</div></div>)}</div></section><section className="states-panel"><div className="panel-heading compact"><div><p className="eyebrow">BATTLEGROUND WATCH</p><h2>Closest states</h2></div><span className="tossup-count">4 toss-ups</span></div><div className="state-list">{states.slice().sort((a, b) => Math.abs(a.you - a.opponent) - Math.abs(b.you - b.opponent)).slice(0, 5).map((state) => <button key={state.name} className="state-row" onMouseEnter={() => setActiveState(state)}><span className="state-abbr">{state.abbreviation}</span><span className="state-name">{state.name}</span><span className="state-margin" data-positive={state.you > state.opponent}>{state.you > state.opponent ? "+" : ""}{(state.you - state.opponent).toFixed(1)}</span><ChevronRight size={14} /></button>)}</div></section><div className="footer-note">Your campaign is a living model. Every response changes what voters think you stand for.</div></aside>
+        <aside className="side-column"><section className="score-card"><div className="score-card-heading"><span className="eyebrow">PROJECTED ELECTORAL VOTE</span><span className="score-trend"><ArrowUpRight size={14} /> +18</span></div><div className="score-number">{electoralCount("you")} <span>/ 538</span></div><div className="score-meter"><span style={{ width: `${(electoralCount("you") / 538) * 100}%` }} /></div><div className="score-foot"><span>270 to win</span><strong>{electoralCount("you") >= 270 ? "Winning" : "Behind by " + Math.max(0, 270 - electoralCount("you"))}</strong></div></section><section className="blocs-panel"><div className="panel-heading compact"><div><p className="eyebrow">THE ELECTORATE</p><h2>Voter blocs</h2></div><button className="text-button">View all <ChevronRight size={15} /></button></div><div className="blocs-list">{blocs.map((bloc) => <div className="bloc-row" key={bloc.name}><div className="bloc-name"><i style={{ backgroundColor: bloc.color }} /><span>{bloc.name}</span><small>{bloc.share}% · {(bloc.population || 0).toLocaleString()}</small></div><div className="bloc-meter"><span style={{ width: `${bloc.you}%`, backgroundColor: bloc.color }} /></div><div className={`bloc-change ${bloc.change > 0 ? "positive" : bloc.change < 0 ? "negative" : "flat"}`}>{bloc.change > 0 ? "+" : ""}{bloc.change.toFixed(1)}</div></div>)}</div></section><section className="states-panel"><div className="panel-heading compact"><div><p className="eyebrow">BATTLEGROUND WATCH</p><h2>Closest states</h2></div><span className="tossup-count">{states.filter((state) => state.category === "tossup").length} toss-ups</span></div><div className="state-list">{states.slice().sort((a, b) => Math.abs(a.you - a.opponent) - Math.abs(b.you - b.opponent)).slice(0, 5).map((state) => <button key={state.name} className="state-row" onMouseEnter={() => setActiveState(state)}><span className="state-abbr">{state.abbreviation}</span><span className="state-name">{state.name}</span><span className="state-margin" data-positive={state.you > state.opponent}>{state.you > state.opponent ? "+" : ""}{(state.you - state.opponent).toFixed(1)}</span><ChevronRight size={14} /></button>)}</div></section><div className="footer-note">Your campaign is a living model. Every response changes what voters think your stand for.</div></aside>
       </div>
     </main>
   );
+}
+
+function HistoryView({ candidateName, snapshots, currentStates, currentBlocs, onBack }: { candidateName: string; snapshots: HistorySnapshot[]; currentStates: StatePoll[]; currentBlocs: Bloc[]; onBack: () => void }) {
+  const [selectedDay, setSelectedDay] = useState(snapshots[snapshots.length - 1]?.day || 1);
+  const snapshot = snapshots.find((item) => item.day === selectedDay) || snapshots[0];
+  const selectedStates = snapshot?.states || [];
+  const selectedBlocs = snapshot?.blocs || [];
+  const leadingStates = selectedStates.slice().sort((a, b) => Math.abs(a.you - a.opponent) - Math.abs(b.you - b.opponent)).slice(0, 5);
+
+  return <main className="campaign-shell"><header className="topbar"><button className="brand-lockup brand-button" onClick={onBack}><div className="brand-mark"><Vote size={18} strokeWidth={2.4} /></div><div><p className="eyebrow">FANTASY CANDIDATE</p><p className="brand-title">{candidateName}&apos;s record</p></div></button><div className="topbar-status">CAMPAIGN HISTORY</div><button className="help-button" aria-label="Return to live campaign" onClick={onBack}><ArrowRight size={19} /></button></header><div className="history-shell"><div className="history-heading"><div><p className="eyebrow accent">THE RECORD</p><h1>Every day<br /><span>leaves a mark.</span></h1></div><button className="secondary-action history-back" onClick={onBack}>Back to live campaign <ArrowRight size={14} /></button></div><div className="history-days">{snapshots.map((item) => <button key={item.day} className={item.day === selectedDay ? "active" : ""} onClick={() => setSelectedDay(item.day)}><small>DAY</small><strong>{item.day}</strong></button>)}</div>{snapshot && <div className="history-grid"><section className="history-map-panel"><div className="panel-heading"><div><p className="eyebrow">DAY {snapshot.day} SNAPSHOT</p><h2>Where the map stood</h2></div><span className="history-current-label">{snapshot.day === snapshots[snapshots.length - 1]?.day ? "CURRENT" : "ARCHIVED"}</span></div><div className="history-map"><ComposableMap projection="geoAlbersUsa" projectionConfig={{ scale: 920 }} width={900} height={520} className="us-map"><Geographies geography={geoUrl}>{({ geographies }) => geographies.map((geo) => { const state = selectedStates.find((item) => item.name === geo.properties?.name); return <Geography key={geo.rsmKey} geography={geo} fill={stateFill(state)} stroke="#15202c" strokeWidth={0.7} className="state-shape" />; })}</Geographies></ComposableMap></div><div className="history-compare">{leadingStates.map((state) => { const current = currentStates.find((item) => item.name === state.name); const delta = current ? (current.you - current.opponent) - (state.you - state.opponent) : 0; return <div key={state.name}><span>{state.abbreviation}</span><strong>{state.you.toFixed(1)} / {state.opponent.toFixed(1)}</strong><small className={delta >= 0 ? "positive" : "negative"}>{delta >= 0 ? "+" : ""}{delta.toFixed(1)} since then</small></div>; })}</div></section><section className="history-side"><div className="history-card"><p className="eyebrow">VOTER BLOC CENSUS</p><h2>Who was listening?</h2><div className="history-blocs">{selectedBlocs.map((bloc) => { const current = currentBlocs.find((item) => item.name === bloc.name); const delta = current ? current.you - bloc.you : 0; return <div key={bloc.name}><div><span>{bloc.name}</span><small>{(bloc.population || 0).toLocaleString()}</small></div><div className="history-bloc-meter"><span style={{ width: `${bloc.you}%`, backgroundColor: bloc.color }} /></div><em className={delta >= 0 ? "positive" : "negative"}>{delta >= 0 ? "+" : ""}{delta.toFixed(1)} pts</em></div>; })}</div></div><div className="history-card"><p className="eyebrow">CLOSEST STATES</p><h2>Pressure points</h2><div className="history-state-list">{leadingStates.map((state) => <div key={state.name}><span>{state.name}</span><strong>{state.you > state.opponent ? "You" : "Hale"} +{Math.abs(state.you - state.opponent).toFixed(1)}</strong></div>)}</div></div></section></div>}</div></main>;
 }

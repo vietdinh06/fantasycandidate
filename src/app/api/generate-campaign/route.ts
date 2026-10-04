@@ -55,7 +55,7 @@ function cleanCampaign(value: unknown, states: Array<{ name: string }>, candidat
 }
 
 export async function POST(request: Request) {
-  const body = await request.json() as { candidateName?: string; party?: string; homeState?: string; states?: Array<{ name: string }> };
+  const body = await request.json() as { candidateName?: string; party?: string; homeState?: string; background?: string; states?: Array<{ name: string }> };
   const candidateName = body.candidateName?.trim() || "Your candidate";
   const party = body.party || "Independent";
   const homeState = body.homeState || "Michigan";
@@ -69,7 +69,7 @@ export async function POST(request: Request) {
     const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
     const completion = await client.chat.completions.create({
       model: process.env.OPENAI_MODEL || "gpt-4o-mini",
-      temperature: 1.15,
+      temperature: 1,
       response_format: { type: "json_object" },
       messages: [
         {
@@ -78,7 +78,7 @@ export async function POST(request: Request) {
         },
         {
           role: "user",
-          content: JSON.stringify({ candidateName, party, homeState, states: states.map(({ name }) => name) }),
+          content: JSON.stringify({ candidateName, party, homeState, background: body.background || "", states: states.map(({ name }) => name) }),
         },
       ],
     });
