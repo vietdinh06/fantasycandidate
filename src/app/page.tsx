@@ -8,6 +8,7 @@ type Candidate = "you" | "opponent";
 type Party = "Democrat" | "Republican" | "Independent";
 type Screen = "home" | "setup" | "campaign";
 type CampaignTab = "live" | "history";
+type CampaignEvent = { label: string; question: string; context: string; scenario: string };
 
 type StatePoll = {
   name: string;
@@ -39,6 +40,17 @@ type HistorySnapshot = {
   day: number;
   states: StatePoll[];
   blocs: Bloc[];
+};
+
+type OpponentReaction = { response: string; reaction: string; news: string; source: string };
+
+type ResponseInterpretation = {
+  intent: string;
+  policySignals: Record<string, number>;
+  affectedBlocs: string[];
+  promises: string[];
+  contradictions: string[];
+  mediaNarrative: string;
 };
 
 const geoUrl = "https://cdn.jsdelivr.net/npm/us-atlas@3/states-10m.json";
@@ -102,12 +114,17 @@ export default function Home() {
   const [states, setStates] = useState<StatePoll[]>([]);
   const [blocs, setBlocs] = useState<Bloc[]>([]);
   const [response, setResponse] = useState("");
+  const [lastResponse, setLastResponse] = useState("Your next answer will become part of the record.");
+  const [isSubmittingResponse, setIsSubmittingResponse] = useState(false);
   const [eventIndex, setEventIndex] = useState(0);
   const [activeState, setActiveState] = useState<StatePoll | null>(null);
   const [cursor, setCursor] = useState({ x: 0, y: 0 });
   const [lastAction, setLastAction] = useState("Your first response is waiting.");
+  const [currentEvent, setCurrentEvent] = useState<CampaignEvent>({ ...eventQuestions[0], scenario: "The campaign opens with a question nobody expected to matter." });
+  const [eventNews, setEventNews] = useState("The campaign opens with a question nobody expected to matter.");
+  const [opponentReaction, setOpponentReaction] = useState<OpponentReaction>({ response: "Morgan Hale is waiting to see which version of you walks onto the stage.", reaction: "The opposition is watching for a contradiction.", news: "The race begins without a settled story.", source: "pending" });
 
-  const question = eventQuestions[eventIndex % eventQuestions.length];
+  const question = currentEvent;
   const national = useMemo(() => {
     const you = states.reduce((total, state) => total + state.you, 0) / states.length;
     const opponent = states.reduce((total, state) => total + state.opponent, 0) / states.length;
@@ -156,7 +173,12 @@ export default function Home() {
       setStates(initialStates);
       setBlocs(initialBlocs);
       setHistory([{ day: 1, states: initialStates, blocs: initialBlocs }]);
-      const saved = await fetch("/api/campaigns", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ candidateName: name, party, homeState, background, summary: generated.summary, states: initialStates, blocs: initialBlocs, event: { category: eventQuestions[0].context, prompt: eventQuestions[0].question } }) });
+      const openingResponse = await fetch("/api/generate-event", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ day: 1, candidateName: name, candidateSummary: generated.summary, background, voterBlocs: initialBlocs.map((bloc) => bloc.name) }) });
+      const opening = await openingResponse.json() as { event?: CampaignEvent; news?: string };
+      const openingEvent = opening.event || { ...eventQuestions[0], scenario: "The campaign opens with a question nobody expected to matter." };
+      setCurrentEvent(openingEvent);
+      setEventNews(opening.news || openingEvent.scenario);
+      const saved = await fetch("/api/campaigns", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ candidateName: name, party, homeState, background, summary: generated.summary, states: initialStates, blocs: initialBlocs, event: { category: openingEvent.context, prompt: openingEvent.question, scenario: openingEvent.scenario } }) });
       if (saved.ok) setCampaignId((await saved.json() as { campaignId?: string }).campaignId || null);
     } catch {
       const fallbackLeans = stateCatalog.map(([stateName]) => ({ name: stateName, lean: Math.round((Math.random() * 50 - 25) * 10) / 10 }));
@@ -167,7 +189,10 @@ export default function Home() {
       setStates(initialStates);
       setBlocs(initialBlocs);
       setHistory([{ day: 1, states: initialStates, blocs: initialBlocs }]);
-      const saved = await fetch("/api/campaigns", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ candidateName: name, party, homeState, background, summary: `${name} is a ${party.toLowerCase()} candidate from ${homeState} with an unpredictable coalition and no obligation to resemble ordinary politics.`, states: initialStates, blocs: initialBlocs, event: { category: eventQuestions[0].context, prompt: eventQuestions[0].question } }) });
+      const fallbackEvent = { ...eventQuestions[0], scenario: "The campaign opens with a question nobody expected to matter." };
+      setCurrentEvent(fallbackEvent);
+      setEventNews(fallbackEvent.scenario);
+      const saved = await fetch("/api/campaigns", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ candidateName: name, party, homeState, background, summary: `${name} is a ${party.toLowerCase()} candidate from ${homeState} with an unpredictable coalition and no obligation to resemble ordinary politics.`, states: initialStates, blocs: initialBlocs, event: { category: fallbackEvent.context, prompt: fallbackEvent.question, scenario: fallbackEvent.scenario } }) });
       if (saved.ok) setCampaignId((await saved.json() as { campaignId?: string }).campaignId || null);
     } finally {
       setIsGenerating(false);
@@ -191,31 +216,67 @@ export default function Home() {
     </main>
   );
 
-  function submitResponse(event: FormEvent<HTMLFormElement>) {
+  async function submitResponse(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!response.trim()) return;
+    const submittedText = response.trim();
+    if (!submittedText || isSubmittingResponse) return;
+    setIsSubmittingResponse(true);
 
-    const words = response.toLowerCase();
-    const isJobsFocused = /job|wage|factory|worker|manufactur|union/.test(words);
-    const isCostFocused = /cost|price|tax|rent|health|grocery|inflation/.test(words);
-    const lift = isJobsFocused || isCostFocused ? 1.1 : 0.45;
-    const focus = isJobsFocused ? "the work-and-wage coalition" : isCostFocused ? "the comfort-and-cost coalition" : "the undecided blocs";
+    let interpretation: ResponseInterpretation;
+    let interpretationSource = "fallback";
+    try {
+      const interpreted = await fetch("/api/interpret-response", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: submittedText, blocNames: blocs.map((bloc) => bloc.name), candidateSummary }) });
+      const result = await interpreted.json() as { source?: string; interpretation?: ResponseInterpretation };
+      interpretation = result.interpretation || { intent: "unclassified instinct", policySignals: {}, affectedBlocs: [], promises: [], contradictions: [], mediaNarrative: "The electorate is still trying to decide what that meant." };
+      interpretationSource = result.source || interpretationSource;
+    } catch {
+      interpretation = { intent: "unclassified instinct", policySignals: {}, affectedBlocs: [], promises: [], contradictions: [], mediaNarrative: "The electorate is still trying to decide what that meant." };
+    }
+
+    const signalValues = Object.values(interpretation.policySignals);
+    const signalStrength = signalValues.length ? signalValues.reduce((total, signal) => total + signal, 0) / signalValues.length : 0.25;
+    const lift = clamp(0.45 + Math.abs(signalStrength) * 0.85, 0.35, 1.35);
+    const affectedBlocs = new Set(interpretation.affectedBlocs);
 
     const nextStates = states.map((state, index) => {
-      const isTarget = ["Michigan", "Pennsylvania", "Wisconsin", "Arizona"].includes(state.name);
+      const isTarget = index % 4 === 0 || Math.abs(state.you - state.opponent) < 4;
       const adjustment = isTarget ? lift + (index % 2 === 0 ? 0.15 : 0) : lift * 0.18;
       return { ...state, you: clamp(state.you + adjustment, 35, 60), opponent: clamp(state.opponent - adjustment * 0.68, 35, 60) };
     });
     const nextBlocs = blocs.map((bloc, index) => {
-      const matches = (isJobsFocused || isCostFocused) && index < 2;
+      const matches = affectedBlocs.size ? affectedBlocs.has(bloc.name) : index < 2;
       return matches ? { ...bloc, you: clamp(bloc.you + 2.2, 0, 100), change: bloc.change + 0.9 } : bloc;
     });
     setStates(nextStates);
     setBlocs(nextBlocs);
     setHistory((current) => [...current, { day: current.length + 1, states: nextStates, blocs: nextBlocs }]);
-    setLastAction(`Response filed. The model read it as ${isJobsFocused ? "an economic populist message" : isCostFocused ? "a cost-of-living message" : "a broad leadership message"}, lifting ${focus}.`);
-    setResponse("");
-    setEventIndex((current) => current + 1);
+    setLastAction(`Response filed as ${interpretation.intent}. ${interpretation.mediaNarrative} (${interpretationSource}).`);
+    try {
+      const [opponentResult, eventResult] = await Promise.all([
+        fetch("/api/opponent-react", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ candidateName, opponentName: "Morgan Hale", candidateSummary, event: question.question, playerResponse: submittedText, interpretation }) }),
+        fetch("/api/generate-event", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ day: eventIndex + 2, candidateName, candidateSummary, background, previousResponse: submittedText, voterBlocs: nextBlocs.map((bloc) => bloc.name) }) }),
+      ]);
+      const opponent = await opponentResult.json() as { source?: string; response?: string; reaction?: string; news?: string };
+      const nextEvent = await eventResult.json() as { event?: CampaignEvent; news?: string };
+      if (opponent.response) setOpponentReaction({ response: opponent.response, reaction: opponent.reaction || "The opposition is recalculating.", news: opponent.news || "The response is moving through the campaign.", source: opponent.source || "fallback" });
+      if (nextEvent.event) setCurrentEvent(nextEvent.event);
+      setEventNews(`${opponent.news || "The response is moving through the campaign."} ${nextEvent.news || "A new question is waiting."}`);
+    } catch {
+      setEventNews("The response is moving through the campaign. A new question is waiting.");
+    }
+    try {
+      if (campaignId) {
+        const saved = await fetch(`/api/campaigns/${campaignId}/responses`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ day: eventIndex + 1, text: submittedText, interpretation, consequences: { lift, affectedBlocs: interpretation.affectedBlocs, mediaNarrative: interpretation.mediaNarrative }, event: { category: question.context, prompt: question.question }, states: nextStates, blocs: nextBlocs }) });
+        if (!saved.ok) setLastAction((current) => `${current} The local result is ready, but the archive could not be updated.`);
+      }
+    } catch {
+      setLastAction((current) => `${current} The local result is ready, but the archive could not be updated.`);
+    } finally {
+      setLastResponse(submittedText);
+      setResponse("");
+      setEventIndex((current) => current + 1);
+      setIsSubmittingResponse(false);
+    }
   }
 
   if (campaignTab === "history") return <HistoryView candidateName={candidateName} snapshots={history} currentStates={states} currentBlocs={blocs} onBack={() => setCampaignTab("live")} />;
@@ -235,8 +296,11 @@ export default function Home() {
 
           <section className="map-panel"><div className="panel-heading"><div><p className="eyebrow">ELECTORAL COLLEGE</p><h2>The road to 270</h2></div><div className="map-legend"><span><i className="legend-swatch you-swatch" /> You</span><span><i className="legend-swatch opponent-swatch" /> Hale</span><span><i className="legend-swatch tossup-swatch" /> Toss-up</span></div></div><div className="map-wrap" onMouseMove={(event) => { const bounds = event.currentTarget.getBoundingClientRect(); setCursor({ x: event.clientX - bounds.left, y: event.clientY - bounds.top }); }}><ComposableMap projection="geoAlbersUsa" projectionConfig={{ scale: 920 }} width={900} height={520} className="us-map"><Geographies geography={geoUrl}>{({ geographies }) => geographies.map((geo) => { const state = states.find((item) => item.name === geo.properties?.name); return <Geography key={geo.rsmKey} geography={geo} fill={stateFill(state)} stroke="#15202c" strokeWidth={0.7} className="state-shape" onMouseEnter={() => state && setActiveState(state)} onMouseLeave={() => setActiveState(null)} />; })}</Geographies></ComposableMap>{activeState && <div className="state-tooltip state-tooltip-follow" style={{ left: `${cursor.x + 16}px`, top: `${cursor.y + 16}px` }}><div><span>{activeState.name}</span><strong>{activeState.electoralVotes} EV</strong></div><p><b>{activeState.you.toFixed(1)}%</b> you <span>vs.</span> <b>{activeState.opponent.toFixed(1)}%</b> Hale</p><small>{activeState.population.toLocaleString()} residents · {activeState.you > activeState.opponent ? "You lead" : "Hale leads"} by {Math.abs(activeState.you - activeState.opponent).toFixed(1)} pts</small></div>}</div><div className="map-foot"><span><MapPin size={14} /> Hover a state to inspect the race</span><span><b>{electoralCount("you")}</b> of 270 electoral votes projected</span></div></section>
 
-          <section className="response-panel"><div className="event-meta"><span className="on-air"><Radio size={13} /> ON AIR</span><span>{question.label}</span><span><Clock3 size={14} /> DAY {eventIndex + 1} OF 30</span></div><p className="eyebrow accent">QUESTION {eventIndex + 1}</p><h2>{question.question}</h2><p className="event-context">{question.context} <span>·</span> Your response becomes part of your record.</p><form onSubmit={submitResponse}><textarea value={response} onChange={(event) => setResponse(event.target.value)} placeholder="Say what you believe..." maxLength={500} aria-label="Your campaign response" /><div className="composer-footer"><span>{response.length}/500</span><button type="submit" disabled={!response.trim()}>Submit response <Send size={15} /></button></div></form><p className="action-log">{lastAction}</p></section>
         </section>
+
+        <section className="response-panel"><div className="event-meta"><span className="on-air"><Radio size={13} /> ON AIR</span><span>{question.label}</span><span><Clock3 size={14} /> DAY {eventIndex + 1} OF 30</span></div><p className="eyebrow accent">QUESTION {eventIndex + 1}</p><h2>{question.question}</h2><p className="event-context">{question.context} <span>·</span> {question.scenario}</p><form onSubmit={submitResponse}><textarea value={response} onChange={(event) => setResponse(event.target.value)} placeholder="Say what you believe..." maxLength={500} aria-label="Your campaign response" /><div className="composer-footer"><span>{response.length}/500</span><button type="submit" disabled={!response.trim() || isSubmittingResponse}>{isSubmittingResponse ? "Interpreting..." : "Submit response"} <Send size={15} /></button></div></form><p className="action-log">{lastAction}</p></section>
+
+        <section className="reaction-grid"><article className="reaction-card candidate-reaction"><div className="reaction-label"><Sparkles size={15} /> YOUR ANSWER</div><p className="reaction-quote">{lastResponse}</p><p className="reaction-text">{eventNews}</p><span className="reaction-source">NATIONAL REACTION</span></article><article className="reaction-card opponent-reaction"><div className="reaction-label"><Radio size={15} /> MORGAN HALE</div><p className="reaction-quote">{opponentReaction.response}</p><p className="reaction-text">{opponentReaction.reaction}</p><span className="reaction-source">{opponentReaction.source.toUpperCase()} OPPOSITION RESPONSE</span></article></section>
 
         <aside className="side-column"><section className="score-card"><div className="score-card-heading"><span className="eyebrow">PROJECTED ELECTORAL VOTE</span><span className="score-trend"><ArrowUpRight size={14} /> +18</span></div><div className="score-number">{electoralCount("you")} <span>/ 538</span></div><div className="score-meter"><span style={{ width: `${(electoralCount("you") / 538) * 100}%` }} /></div><div className="score-foot"><span>270 to win</span><strong>{electoralCount("you") >= 270 ? "Winning" : "Behind by " + Math.max(0, 270 - electoralCount("you"))}</strong></div></section><section className="blocs-panel"><div className="panel-heading compact"><div><p className="eyebrow">THE ELECTORATE</p><h2>Voter blocs</h2></div><button className="text-button">View all <ChevronRight size={15} /></button></div><div className="blocs-list">{blocs.map((bloc) => <div className="bloc-row" key={bloc.name}><div className="bloc-name"><i style={{ backgroundColor: bloc.color }} /><span>{bloc.name}</span><small>{bloc.share}% · {(bloc.population || 0).toLocaleString()}</small></div><div className="bloc-meter"><span style={{ width: `${bloc.you}%`, backgroundColor: bloc.color }} /></div><div className={`bloc-change ${bloc.change > 0 ? "positive" : bloc.change < 0 ? "negative" : "flat"}`}>{bloc.change > 0 ? "+" : ""}{bloc.change.toFixed(1)}</div></div>)}</div></section><section className="states-panel"><div className="panel-heading compact"><div><p className="eyebrow">BATTLEGROUND WATCH</p><h2>Closest states</h2></div><span className="tossup-count">{states.filter((state) => state.category === "tossup").length} toss-ups</span></div><div className="state-list">{states.slice().sort((a, b) => Math.abs(a.you - a.opponent) - Math.abs(b.you - b.opponent)).slice(0, 5).map((state) => <button key={state.name} className="state-row" onMouseEnter={() => setActiveState(state)}><span className="state-abbr">{state.abbreviation}</span><span className="state-name">{state.name}</span><span className="state-margin" data-positive={state.you > state.opponent}>{state.you > state.opponent ? "+" : ""}{(state.you - state.opponent).toFixed(1)}</span><ChevronRight size={14} /></button>)}</div></section><div className="footer-note">Your campaign is a living model. Every response changes what voters think your stand for.</div></aside>
       </div>
